@@ -7,6 +7,7 @@
  *
 */
 
+#include <M5StickC.h>
 #include <NimBLEDevice.h>
 
 void scanEndedCB(NimBLEScanResults results);
@@ -15,6 +16,9 @@ static NimBLEAdvertisedDevice* advDevice;
 
 static bool doConnect = false;
 static uint32_t scanTime = 0; /** 0 = scan forever */
+
+static uint32_t reconnect_count = 0;
+static uint32_t notify_count = 0;
 
 
 /**  None of these are required as they will be handled by the library with defaults. **
@@ -32,6 +36,9 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     };
 
     void onDisconnect(NimBLEClient* pClient) {
+        reconnect_count++;
+        M5.Lcd.drawNumber(reconnect_count, 50, 0, 2);
+
         Serial.print(pClient->getPeerAddress().toString().c_str());
         Serial.println(" Disconnected - Starting scan");
         NimBLEDevice::getScan()->start(scanTime, scanEndedCB);
@@ -88,7 +95,7 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
         Serial.print("Advertised Device found: ");
         Serial.println(advertisedDevice->toString().c_str());
-        if(advertisedDevice->isAdvertisingService(NimBLEUUID("DEAD")))
+        if(advertisedDevice->isAdvertisingService(NimBLEUUID("ef680100-9b35-4933-9b10-52ffa9740042")))
         {
             Serial.println("Found Our Service");
             /** stop scan before connecting */
@@ -104,6 +111,7 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
 
 /** Notification / Indication receiving handler callback */
 void notifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify){
+    digitalWrite(GPIO_NUM_10, LOW);
     std::string str = (isNotify == true) ? "Notification" : "Indication";
     str += " from ";
     /** NimBLEAddress and NimBLEUUID have std::string operators */
@@ -112,6 +120,55 @@ void notifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData,
     str += ", Characteristic = " + std::string(pRemoteCharacteristic->getUUID());
     str += ", Value = " + std::string((char*)pData, length);
     Serial.println(str.c_str());
+    if(std::string(pRemoteCharacteristic->getUUID()) == "ef680201-9b35-4933-9b10-52ffa9740042")
+    {
+        Serial.println("---");
+        for (size_t i = 0; i < length; ++i)
+        {
+            Serial.print(pData[i]);
+        }
+        Serial.println("---");
+
+        int8_t integer = pData[0];
+        uint8_t decimal = pData[1];
+
+        Serial.print(integer);
+        Serial.println(decimal);
+
+        char buff[100];
+        snprintf(buff, sizeof(buff), "Temp: %i.%i°C", integer, decimal);
+        std::string temp = buff;
+        M5.Lcd.drawString(temp.c_str(), 0, 29, 2);
+    }
+    if(std::string(pRemoteCharacteristic->getUUID()) == "ef680204-9b35-4933-9b10-52ffa9740042")
+    {
+        Serial.println("---");
+        for (size_t i = 0; i < length; ++i)
+        {
+            Serial.print(pData[i]);
+        }
+        Serial.println("---");
+
+        uint16_t eCO2_ppm = (pData[1] << 8) | pData[0];
+        uint16_t TVOC_ppb = (pData[3] << 8) | pData[2];
+
+        char buff[100];
+        snprintf(buff, sizeof(buff), "CO2: %4u", eCO2_ppm);
+        std::string co2 = buff;
+
+        M5.Lcd.drawString(co2.c_str(), 0, 49, 2);
+        if(eCO2_ppm <= 699)
+            M5.Lcd.fillCircle(40, 100, 20, TFT_GREEN);
+        if(eCO2_ppm > 699 && eCO2_ppm < 1099)
+            M5.Lcd.fillCircle(40, 100, 20, TFT_GREENYELLOW);
+        if(eCO2_ppm > 1099 && eCO2_ppm < 1500)
+            M5.Lcd.fillCircle(40, 100, 20, TFT_ORANGE);
+
+
+    }
+    notify_count++;
+    M5.Lcd.drawNumber(notify_count, 0, 140, 2);
+    digitalWrite(GPIO_NUM_10, HIGH);
 }
 
 /** Callback to process the results of the last scan or restart it */
@@ -195,11 +252,10 @@ bool connectToServer() {
     /** Now we can read/write/subscribe the charateristics of the services we are interested in */
     NimBLERemoteService* pSvc = nullptr;
     NimBLERemoteCharacteristic* pChr = nullptr;
-    NimBLERemoteDescriptor* pDsc = nullptr;
 
-    pSvc = pClient->getService("DEAD");
+    pSvc = pClient->getService("ef680200-9b35-4933-9b10-52ffa9740042");
     if(pSvc) {     /** make sure it's not null */
-        pChr = pSvc->getCharacteristic("BEEF");
+        pChr = pSvc->getCharacteristic("ef680201-9b35-4933-9b10-52ffa9740042");
 
         if(pChr) {     /** make sure it's not null */
             if(pChr->canRead()) {
@@ -208,116 +264,52 @@ bool connectToServer() {
                 Serial.println(pChr->readValue().c_str());
             }
 
-            if(pChr->canWrite()) {
-                if(pChr->writeValue("Tasty")) {
-                    Serial.print("Wrote new value to: ");
-                    Serial.println(pChr->getUUID().toString().c_str());
-                }
-                else {
-                    /** Disconnect if write failed */
-                    pClient->disconnect();
-                    return false;
-                }
-
-                if(pChr->canRead()) {
-                    Serial.print("The value of: ");
-                    Serial.print(pChr->getUUID().toString().c_str());
-                    Serial.print(" is now: ");
-                    Serial.println(pChr->readValue().c_str());
-                }
-            }
-
             /** registerForNotify() has been deprecated and replaced with subscribe() / unsubscribe().
              *  Subscribe parameter defaults are: notifications=true, notifyCallback=nullptr, response=false.
              *  Unsubscribe parameter defaults are: response=false.
              */
             if(pChr->canNotify()) {
                 //if(!pChr->registerForNotify(notifyCB)) {
-                if(!pChr->subscribe(true, notifyCB)) {
-                    /** Disconnect if subscribe failed */
-                    pClient->disconnect();
-                    return false;
-                }
-            }
-            else if(pChr->canIndicate()) {
-                /** Send false as first argument to subscribe to indications instead of notifications */
-                //if(!pChr->registerForNotify(notifyCB, false)) {
-                if(!pChr->subscribe(false, notifyCB)) {
+                if(!pChr->subscribe(true, notifyCB, true)) {
                     /** Disconnect if subscribe failed */
                     pClient->disconnect();
                     return false;
                 }
             }
         }
-
+        else{
+            Serial.println("Temperature characteristic not found.");
+        }
     } else {
-        Serial.println("DEAD service not found.");
+        Serial.println("Environment service not found.");
+        return false;
     }
 
-    pSvc = pClient->getService("BAAD");
-    if(pSvc) {     /** make sure it's not null */
-        pChr = pSvc->getCharacteristic("F00D");
-
-        if(pChr) {     /** make sure it's not null */
-            if(pChr->canRead()) {
-                Serial.print(pChr->getUUID().toString().c_str());
-                Serial.print(" Value: ");
-                Serial.println(pChr->readValue().c_str());
-            }
-
-            pDsc = pChr->getDescriptor(NimBLEUUID("C01D"));
-            if(pDsc) {   /** make sure it's not null */
-                Serial.print("Descriptor: ");
-                Serial.print(pDsc->getUUID().toString().c_str());
-                Serial.print(" Value: ");
-                Serial.println(pDsc->readValue().c_str());
-            }
-
-            if(pChr->canWrite()) {
-                if(pChr->writeValue("No tip!")) {
-                    Serial.print("Wrote new value to: ");
-                    Serial.println(pChr->getUUID().toString().c_str());
-                }
-                else {
-                    /** Disconnect if write failed */
-                    pClient->disconnect();
-                    return false;
-                }
-
-                if(pChr->canRead()) {
-                    Serial.print("The value of: ");
-                    Serial.print(pChr->getUUID().toString().c_str());
-                    Serial.print(" is now: ");
-                    Serial.println(pChr->readValue().c_str());
-                }
-            }
-
-            /** registerForNotify() has been deprecated and replaced with subscribe() / unsubscribe().
-             *  Subscribe parameter defaults are: notifications=true, notifyCallback=nullptr, response=false.
-             *  Unsubscribe parameter defaults are: response=false.
-             */
-            if(pChr->canNotify()) {
-                //if(!pChr->registerForNotify(notifyCB)) {
-                if(!pChr->subscribe(true, notifyCB)) {
-                    /** Disconnect if subscribe failed */
-                    pClient->disconnect();
-                    return false;
-                }
-            }
-            else if(pChr->canIndicate()) {
-                /** Send false as first argument to subscribe to indications instead of notifications */
-                //if(!pChr->registerForNotify(notifyCB, false)) {
-                if(!pChr->subscribe(false, notifyCB)) {
-                    /** Disconnect if subscribe failed */
-                    pClient->disconnect();
-                    return false;
-                }
-            }
+    pChr = pSvc->getCharacteristic("ef680204-9b35-4933-9b10-52ffa9740042");
+    if(pChr) {     /** make sure it's not null */
+        if(pChr->canRead()) {
+            Serial.print(pChr->getUUID().toString().c_str());
+            Serial.print(" Value: ");
+            Serial.println(pChr->readValue().c_str());
         }
 
-    } else {
-        Serial.println("BAAD service not found.");
+        /** registerForNotify() has been deprecated and replaced with subscribe() / unsubscribe().
+         *  Subscribe parameter defaults are: notifications=true, notifyCallback=nullptr, response=false.
+         *  Unsubscribe parameter defaults are: response=false.
+         */
+        if(pChr->canNotify()) {
+            //if(!pChr->registerForNotify(notifyCB)) {
+            if(!pChr->subscribe(true, notifyCB, true)) {
+                /** Disconnect if subscribe failed */
+                pClient->disconnect();
+                return false;
+            }
+        }
     }
+    else{
+        Serial.println("CO2 characteristic not found.");
+    }
+
 
     Serial.println("Done with this device!");
     return true;
@@ -325,6 +317,16 @@ bool connectToServer() {
 
 void setup (){
     Serial.begin(115200);
+    pinMode(GPIO_NUM_10, OUTPUT);
+    digitalWrite(GPIO_NUM_10, HIGH);
+    M5.begin();
+    // M5.Lcd.setRotation(1);
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Axp.ScreenBreath(10);
+    M5.Lcd.drawString("BLE", 0, 0, 2);
+
+
     Serial.println("Starting NimBLE Client");
     /** Initialize NimBLE, no device name spcified as we are not advertising */
     NimBLEDevice::init("");
@@ -371,21 +373,20 @@ void setup (){
     pScan->start(scanTime, scanEndedCB);
 }
 
-
+bool backlight_toogle = true;
 void loop (){
-    /** Loop here until we find a device we want to connect to */
-    while(!doConnect){
-        delay(1);
+    if(doConnect){
+        /** Found a device we want to connect to, do it now */
+        if(connectToServer()) {
+            Serial.println("Success! we should now be getting notifications.");
+        }
+        doConnect = false;
     }
-
-    doConnect = false;
-
-    /** Found a device we want to connect to, do it now */
-    if(connectToServer()) {
-        Serial.println("Success! we should now be getting notifications, scanning for more!");
-    } else {
-        Serial.println("Failed to connect, starting scan");
+    if(M5.BtnA.wasPressed())
+    {
+        Serial.println("Button press");
+        backlight_toogle = !backlight_toogle;
+        M5.Axp.SetLDO2(backlight_toogle);
     }
-
-    NimBLEDevice::getScan()->start(scanTime,scanEndedCB);
+    M5.update();
 }
